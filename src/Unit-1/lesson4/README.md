@@ -234,203 +234,12 @@ Recall that we could have many clones of this exact structure working in paralle
 > You may also hear people use the term "error kernel," which refers to how much of the system is affected by the failure. You may also hear "error kernel pattern," which is just fancy shorthand for the approach I just explained where we push dangerous behavior to child actors to isolate/protect the parent.
 
 ## Exercise
-To start off, we need to do some upgrading of our system. We are going to add in the components which will enable our actor system to actually monitor a file for changes. We have most of the classes we need, but there are a few pieces of utility code that we need to add.
-
-We're almost done! We really just need to add the `TailCoordinatorActor`, `TailActor`, and the `FileObserver`.
+To start off, we need to do some upgrading of our system. We are going to add in the components which will enable our actor system to actually monitor a file for changes. We have most of the classes we need, but there are a few pieces of utility code that we need to add: the `TailCoordinatorActor`, `TailActor`, and the `FileObserver`. 
 
 The goal of this exercise is to show you how to make a parent/child actor relationship.
 
-### Phase 1: A quick bit of prep
-#### Replace `ValidationActor` with `FileValidatorActor`
-Since we're shifting to actually looking at files now, go ahead and replace `ValidationActor` with `FileValidatorActor`.
-
-Add a new class, `FileValidatorActor`, with [this code](Completed/FileValidatorActor.cs):
-
-```csharp
-// FileValidatorActor.cs
-using System.IO;
-using Akka.Actor;
-
-namespace WinTail
-{
-    /// <summary>
-    /// Actor that validates user input and signals result to others.
-    /// </summary>
-    public class FileValidatorActor : UntypedActor
-    {
-        private readonly IActorRef _consoleWriterActor;
-        private readonly IActorRef _tailCoordinatorActor;
-
-        public FileValidatorActor(IActorRef consoleWriterActor, IActorRef tailCoordinatorActor)
-        {
-            _consoleWriterActor = consoleWriterActor;
-            _tailCoordinatorActor = tailCoordinatorActor;
-        }
-
-        protected override void OnReceive(object message)
-        {
-            var msg = message as string;
-            if (string.IsNullOrEmpty(msg))
-            {
-                // signal that the user needs to supply an input
-                _consoleWriterActor.Tell(new Messages.NullInputError("Input was blank. Please try again.\n"));
-
-                // tell sender to continue doing its thing (whatever that may be, this actor doesn't care)
-                Sender.Tell(new Messages.ContinueProcessing());
-            }
-            else
-            {
-                var valid = IsFileUri(msg);
-                if (valid)
-                {
-                    // signal successful input
-                    _consoleWriterActor.Tell(new Messages.InputSuccess(string.Format("Starting processing for {0}", msg)));
-
-                    // start coordinator
-                    _tailCoordinatorActor.Tell(new TailCoordinatorActor.StartTail(msg, _consoleWriterActor));
-                }
-                else
-                {
-                    // signal that input was bad
-                    _consoleWriterActor.Tell(new Messages.ValidationError(string.Format("{0} is not an existing URI on disk.", msg)));
-
-                    // tell sender to continue doing its thing (whatever that may be, this actor doesn't care)
-                    Sender.Tell(new Messages.ContinueProcessing());
-                }
-            }
-
-
-
-        }
-
-        /// <summary>
-        /// Checks if file exists at path provided by user.
-        /// </summary>
-        /// <param name="path"></param>
-        /// <returns></returns>
-        private static bool IsFileUri(string path)
-        {
-            return File.Exists(path);
-        }
-    }
-}
-```
-
-You'll also want to make sure to update the `Props` instance in `Main` that references the class:
-
-```csharp
-// Program.cs
-Props validationActorProps = Props.Create(() => new FileValidatorActor(consoleWriterActor));
-```
-
-#### Update `DoPrintInstructions`
-Just making a slight tweak to our instructions here, since we'll be using a text file on disk going forward instead of prompting the user for input.
-
-Update `DoPrintInstructions()` to this:
-
-```csharp
-// ConsoleReaderActor.cs
-private void DoPrintInstructions()
-{
-    Console.WriteLine("Please provide the URI of a log file on disk.\n");
-}
-```
-
-#### Add `FileObserver`
-This is a utility class that we're providing for you to use. It does the low-level work of actually watching a file for changes.
-
-Create a new class called `FileObserver` and type in the code for [FileObserver.cs](Completed/FileObserver.cs). If you're running this on Mono, note the extra environment variable that has to be uncommented in the `Start()` method:
-
-```csharp
-// FileObserver.cs
-using System;
-using System.IO;
-using Akka.Actor;
-
-namespace WinTail
-{
-    /// <summary>
-    /// Turns <see cref="FileSystemWatcher"/> events about a specific file into messages for <see cref="TailActor"/>.
-    /// </summary>
-    public class FileObserver : IDisposable
-    {
-        private readonly IActorRef _tailActor;
-        private readonly string _absoluteFilePath;
-        private FileSystemWatcher _watcher;
-        private readonly string _fileDir;
-        private readonly string _fileNameOnly;
-
-        public FileObserver(IActorRef tailActor, string absoluteFilePath)
-        {
-            _tailActor = tailActor;
-            _absoluteFilePath = absoluteFilePath;
-            _fileDir = Path.GetDirectoryName(absoluteFilePath);
-            _fileNameOnly = Path.GetFileName(absoluteFilePath);
-        }
-
-        /// <summary>
-        /// Begin monitoring file.
-        /// </summary>
-        public void Start()
-        {
-            // Need this for Mono 3.12.0 workaround
-            // Environment.SetEnvironmentVariable("MONO_MANAGED_WATCHER", "enabled"); // uncomment this line if you're running on Mono!
-
-            // make watcher to observe our specific file
-            _watcher = new FileSystemWatcher(_fileDir, _fileNameOnly);
-
-            // watch our file for changes to the file name, or new messages being written to file
-            _watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite;
-
-            // assign callbacks for event types
-            _watcher.Changed += OnFileChanged;
-            _watcher.Error += OnFileError;
-
-            // start watching
-            _watcher.EnableRaisingEvents = true;
-
-        }
-
-        /// <summary>
-        /// Stop monitoring file.
-        /// </summary>
-        public void Dispose()
-        {
-            _watcher.Dispose();
-        }
-
-        /// <summary>
-        /// Callback for <see cref="FileSystemWatcher"/> file error events.
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        void OnFileError(object sender, ErrorEventArgs e)
-        {
-            _tailActor.Tell(new TailActor.FileError(_fileNameOnly, e.GetException().Message), ActorRefs.NoSender);
-        }
-
-        /// <summary>
-        /// Callback for <see cref="FileSystemWatcher"/> file change events.
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        void OnFileChanged(object sender, FileSystemEventArgs e)
-        {
-            if (e.ChangeType == WatcherChangeTypes.Changed)
-            {
-                // here we use a special ActorRefs.NoSender
-                // since this event can happen many times, this is a little microoptimization
-                _tailActor.Tell(new TailActor.FileWrite(e.Name), ActorRefs.NoSender);
-            }
-
-        }
-
-    }
-}
-```
-
-### Phase 2: Make your first parent/child actors!
-Great! Now we're ready to create our actor classes that will form a parent/child relationship.
+### Phase 1: Make your first parent/child actors!
+We're ready to create our actor classes that will form a parent/child relationship.
 
 Recall that in the hierarchy we're going for, there is a `TailCoordinatorActor` that coordinates child actors to actually monitor and tail files. For now it will only supervise one child, `TailActor`, but in the future it can easily expand to have many children, each observing/tailing a different file.
 
@@ -449,6 +258,7 @@ namespace WinTail
     public class TailCoordinatorActor : UntypedActor
     {
         #region Message types
+        
         /// <summary>
         /// Start tailing the file at user-specified path.
         /// </summary>
@@ -477,7 +287,7 @@ namespace WinTail
 
             public string FilePath { get; private set; }
         }
-
+        
         #endregion
 
         protected override void OnReceive(object message)
@@ -487,28 +297,12 @@ namespace WinTail
                 var msg = message as StartTail;
                 // YOU NEED TO FILL IN HERE
             }
-
         }
     }
 }
-
-
-
 ```
 
-#### Create `IActorRef` for `TailCoordinatorActor`
-In `Main()`, create a new `IActorRef` for `TailCoordinatorActor` and then pass it into `fileValidatorActorProps`, like so:
 
-```csharp
-// Program.Main
-// make tailCoordinatorActor
-Props tailCoordinatorProps = Props.Create(() => new TailCoordinatorActor());
-IActorRef tailCoordinatorActor = MyActorSystem.ActorOf(tailCoordinatorProps, "tailCoordinatorActor");
-
-// pass tailCoordinatorActor to fileValidatorActorProps (just adding one extra arg)
-Props fileValidatorActorProps = Props.Create(() => new FileValidatorActor(consoleWriterActor, tailCoordinatorActor));
-IActorRef validationActor = MyActorSystem.ActorOf(fileValidatorActorProps, "validationActor");
-```
 
 #### Add `TailActor`
 Now, add a class called `TailActor` in its own file. This actor is the actor that is actually responsible for tailing a given file. `TailActor` will be created and supervised by `TailCoordinatorActor` in a moment.
@@ -524,14 +318,16 @@ using Akka.Actor;
 namespace WinTail
 {
     /// <summary>
-    /// Monitors the file at <see cref="_filePath"/> for changes and sends file updates to console.
+    /// Monitors the file at <see cref="_filePath"/> for changes and sends
+    /// file updates to console.
     /// </summary>
     public class TailActor : UntypedActor
     {
         #region Message types
 
         /// <summary>
-        /// Signal that the file has changed, and we need to read the next line of the file.
+        /// Signal that the file has changed, and we need to 
+        /// read the next line of the file.
         /// </summary>
         public class FileWrite
         {
@@ -591,12 +387,13 @@ namespace WinTail
             _observer = new FileObserver(Self, Path.GetFullPath(_filePath));
             _observer.Start();
 
-            // open the file stream with shared read/write permissions (so file can be written to while open)
-            _fileStream = new FileStream(Path.GetFullPath(_filePath), FileMode.Open, FileAccess.Read,
-                FileShare.ReadWrite);
+            // open the file stream with shared read/write permissions
+            // (so file can be written to while open)
+            _fileStream = new FileStream(Path.GetFullPath(_filePath),
+                FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             _fileStreamReader = new StreamReader(_fileStream, Encoding.UTF8);
 
-            // read the initial contents of the file and send it to console as first message
+            // read the initial contents of the file and send it to console as first msg
             var text = _fileStreamReader.ReadToEnd();
             Self.Tell(new InitialRead(_filePath, text));
         }
@@ -647,14 +444,222 @@ protected override void OnReceive(object message)
 		// here we are creating our first parent/child relationship!
 		// the TailActor instance created here is a child
 		// of this instance of TailCoordinatorActor
-        Context.ActorOf(Props.Create(() => new TailActor(msg.ReporterActor, msg.FilePath)));
+        Context.ActorOf(Props.Create(
+          () => new TailActor(msg.ReporterActor, msg.FilePath)));
     }
-
 }
 ```
 
 ### ***BAM!***
 You have just established your first parent/child actor relationship!
+
+### Phase 2: A quick bit of prep
+#### Replace `ValidationActor` with `FileValidatorActor`
+Since we're shifting to actually looking at files now, go ahead and replace `ValidationActor` with `FileValidatorActor`.
+
+Add a new class, `FileValidatorActor`, with [this code](Completed/FileValidatorActor.cs):
+
+```csharp
+// FileValidatorActor.cs
+using System.IO;
+using Akka.Actor;
+
+namespace WinTail
+{
+    /// <summary>
+    /// Actor that validates user input and signals result to others.
+    /// </summary>
+    public class FileValidatorActor : UntypedActor
+    {
+        private readonly IActorRef _consoleWriterActor;
+        private readonly IActorRef _tailCoordinatorActor;
+
+        public FileValidatorActor(IActorRef consoleWriterActor,
+            IActorRef tailCoordinatorActor)
+        {
+            _consoleWriterActor = consoleWriterActor;
+            _tailCoordinatorActor = tailCoordinatorActor;
+        }
+
+        protected override void OnReceive(object message)
+        {
+            var msg = message as string;
+            if (string.IsNullOrEmpty(msg))
+            {
+                // signal that the user needs to supply an input
+                _consoleWriterActor.Tell(new Messages.NullInputError("Input was blank.
+                Please try again.\n"));
+
+                // tell sender to continue doing its thing (whatever that may be,
+                // this actor doesn't care)
+                Sender.Tell(new Messages.ContinueProcessing());
+            }
+            else
+            {
+                var valid = IsFileUri(msg);
+                if (valid)
+                {
+                    // signal successful input
+                    _consoleWriterActor.Tell(new Messages.InputSuccess(
+                        string.Format("Starting processing for {0}", msg)));
+
+                    // start coordinator
+                    _tailCoordinatorActor.Tell(new TailCoordinatorActor.StartTail(msg,
+                        _consoleWriterActor));
+                }
+                else
+                {
+                    // signal that input was bad
+                    _consoleWriterActor.Tell(new Messages.ValidationError(
+                        string.Format("{0} is not an existing URI on disk.", msg)));
+
+                    // tell sender to continue doing its thing (whatever that
+                    // may be, this actor doesn't care)
+                    Sender.Tell(new Messages.ContinueProcessing());
+                }
+            }
+        }
+
+        /// <summary>
+        /// Checks if file exists at path provided by user.
+        /// </summary>
+        /// <param name="path"></param>
+        /// <returns></returns>
+        private static bool IsFileUri(string path)
+        {
+            return File.Exists(path);
+        }
+    }
+}
+```
+
+#### Create `IActorRef` for `TailCoordinatorActor`
+In `Main()`, create a new `IActorRef` for `TailCoordinatorActor` and then pass it into `fileValidatorActorProps`, like so:
+
+```csharp
+// Program.Main
+// make tailCoordinatorActor
+Props tailCoordinatorProps = Props.Create(() => new TailCoordinatorActor());
+IActorRef tailCoordinatorActor = MyActorSystem.ActorOf(tailCoordinatorProps,
+    "tailCoordinatorActor");
+
+// pass tailCoordinatorActor to fileValidatorActorProps (just adding one extra arg)
+Props fileValidatorActorProps = Props.Create(() =>
+new FileValidatorActor(consoleWriterActor, tailCoordinatorActor));
+IActorRef validationActor = MyActorSystem.ActorOf(fileValidatorActorProps,
+    "validationActor");
+```
+
+#### Update `DoPrintInstructions`
+Just making a slight tweak to our instructions here, since we'll be using a text file on disk going forward instead of prompting the user for input.
+
+Update `DoPrintInstructions()` to this:
+
+```csharp
+// ConsoleReaderActor.cs
+private void DoPrintInstructions()
+{
+    Console.WriteLine("Please provide the URI of a log file on disk.\n");
+}
+```
+
+#### Add `FileObserver`
+This is a utility class that we're providing for you to use. It does the low-level work of actually watching a file for changes.
+
+Create a new class called `FileObserver` and type in the code for [FileObserver.cs](Completed/FileObserver.cs). If you're running this on Mono, note the extra environment variable that has to be uncommented in the `Start()` method:
+
+```csharp
+// FileObserver.cs
+using System;
+using System.IO;
+using Akka.Actor;
+
+namespace WinTail
+{
+    /// <summary>
+    /// Turns <see cref="FileSystemWatcher"/> events about a specific file into
+    /// messages for <see cref="TailActor"/>.
+    /// </summary>
+    public class FileObserver : IDisposable
+    {
+        private readonly IActorRef _tailActor;
+        private readonly string _absoluteFilePath;
+        private FileSystemWatcher _watcher;
+        private readonly string _fileDir;
+        private readonly string _fileNameOnly;
+
+        public FileObserver(IActorRef tailActor, string absoluteFilePath)
+        {
+            _tailActor = tailActor;
+            _absoluteFilePath = absoluteFilePath;
+            _fileDir = Path.GetDirectoryName(absoluteFilePath);
+            _fileNameOnly = Path.GetFileName(absoluteFilePath);
+        }
+
+        /// <summary>
+        /// Begin monitoring file.
+        /// </summary>
+        public void Start()
+        {
+            // Need this for Mono 3.12.0 workaround
+            // uncomment next line if you're running on Mono!
+            // Environment.SetEnvironmentVariable("MONO_MANAGED_WATCHER", "enabled");
+
+            // make watcher to observe our specific file
+            _watcher = new FileSystemWatcher(_fileDir, _fileNameOnly);
+
+            // watch our file for changes to the file name,
+            // or new messages being written to file
+            _watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite;
+
+            // assign callbacks for event types
+            _watcher.Changed += OnFileChanged;
+            _watcher.Error += OnFileError;
+
+            // start watching
+            _watcher.EnableRaisingEvents = true;
+        }
+
+        /// <summary>
+        /// Stop monitoring file.
+        /// </summary>
+        public void Dispose()
+        {
+            _watcher.Dispose();
+        }
+
+        /// <summary>
+        /// Callback for <see cref="FileSystemWatcher"/> file error events.
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        void OnFileError(object sender, ErrorEventArgs e)
+        {
+            _tailActor.Tell(new TailActor.FileError(_fileNameOnly,
+                e.GetException().Message),
+                ActorRefs.NoSender);
+        }
+
+        /// <summary>
+        /// Callback for <see cref="FileSystemWatcher"/> file change events.
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        void OnFileChanged(object sender, FileSystemEventArgs e)
+        {
+            if (e.ChangeType == WatcherChangeTypes.Changed)
+            {
+                // here we use a special ActorRefs.NoSender
+                // since this event can happen many times,
+                // this is a little microoptimization
+                _tailActor.Tell(new TailActor.FileWrite(e.Name), ActorRefs.NoSender);
+            }
+        }
+    }
+}
+```
+
+
 
 ### Phase 3: Implement a `SupervisorStrategy`
 Now it's time to add a supervision strategy to your new parent, `TailCoordinatorActor`.
@@ -718,7 +723,7 @@ Here is a high-level overview of our working system!
 
 ![Akka.NET Unit 1 Tail System Diagram](Images/system_overview.png)
 
-**Let's move onto [Lesson 5 - Looking up Actors by Address with `ActorSelection`](../lesson5).**
+**Let's move onto [Lesson 5 - Looking up Actors by Address with `ActorSelection`](../lesson5/README.md).**
 
 ---
 ## Supervision FAQ
@@ -736,7 +741,6 @@ The current message being processed by an actor when it is halted (regardless of
 
 
 ## Any questions?
-**Don't be afraid to ask questions** :).
 
 Come ask any questions you have, big or small, [in this ongoing Bootcamp chat with the Petabridge & Akka.NET teams](https://gitter.im/petabridge/akka-bootcamp).
 
